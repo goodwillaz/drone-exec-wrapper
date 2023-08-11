@@ -1,0 +1,55 @@
+#!/bin/bash
+
+if [[ "$1" == "--help" ]]; then
+  exec drone exec --help
+fi
+
+# Set up some variables that we'll use later on
+GIT=$(which git)
+PID=/tmp/git-daemon.pid
+PWD=$(pwd)
+DOCKER_NETWORK=drone
+COUNTER=1
+GIT_BRANCH=$(git -C $PWD rev-parse --abbrev-ref HEAD)
+GIT_COMMIT=$(git -C $PWD rev-parse HEAD)
+GIT_REPO=$(basename $PWD)
+GIT_REMOTE=$(git -C $PWD config --get remote.origin.url)
+
+function log() {
+  let COUNT=$((COUNTER++))
+  echo "[exec:${COUNT}] $1"
+}
+
+# Create a docker network for Drone if it doesn't exist
+docker network inspect $DOCKER_NETWORK >/dev/null 2>&1 || docker network create $DOCKER_NETWORK >/dev/null
+DOCKER_IP=$(docker network inspect $DOCKER_NETWORK -f '{{(index .IPAM.Config 0).Gateway}}')
+log "Created Docker Network at ${DOCKER_IP}"
+
+# Start git in daemon mode to serve the repo
+log "Starting Git Daemon at ${PWD}"
+start-stop-daemon \
+  --pidfile $PID \
+  --start \
+  --exec $GIT \
+  -- daemon \
+     --reuseaddr \
+     --listen=$DOCKER_IP \
+     --base-path=$PWD \
+     --export-all \
+     --verbose \
+     --enable=receive-pack \
+     --pid-file=$PID \
+     --detach
+
+# Run drone
+log "Running drone exec and clone from ${DOCKER_IP}"
+export DRONE_REMOTE_URL=git://${DOCKER_IP}/
+drone exec --network $DOCKER_NETWORK --clone --ref refs/heads/$GIT_BRANCH --branch $GIT_BRANCH --repo $GIT_REPO --sha $GIT_COMMIT --trusted --secret-file .secrets --env-file .env "$@"
+
+# Kill git daemon
+log "Stopping git-daemon"
+start-stop-daemon --pidfile $PID --stop --remove-pidfile
+
+# Remove the docker network
+log "Removing Docker Network at ${DOCKER_IP}"
+docker network rm $DOCKER_NETWORK >/dev/null 2>&1
